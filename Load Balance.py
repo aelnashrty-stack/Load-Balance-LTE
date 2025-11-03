@@ -4,89 +4,122 @@
 # In[ ]:
 
 
-import pandas as pd
 import streamlit as st
-from io import BytesIO
+import pandas as pd
+import io
 
-st.set_page_config(page_title="LTE Sector & Band Imbalance Tool", layout="centered")
+st.set_page_config(page_title="LTE Sector Balance Tool", layout="wide")
 
-st.title("📊 LTE Sector & Band Imbalance Analyzer")
-st.write("Upload your LTE KPI Excel file to automatically calculate inter-band and inter-sector imbalance violations.")
+st.title("📶 LTE Sector Balance Checker")
 
-uploaded_file = st.file_uploader("📂 Upload LTE KPI Excel File", type=["xlsx", "xls"])
+# --- Sidebar Threshold Controls ---
+st.sidebar.header("⚙️ Threshold Settings")
+prb_threshold = st.sidebar.number_input(
+    "PRB Utilization Difference Threshold (%)", min_value=1, max_value=100, value=30
+)
+thp_ratio_threshold = st.sidebar.number_input(
+    "User THP Ratio Threshold", min_value=1.0, max_value=5.0, value=1.3
+)
+traffic_ratio_threshold = st.sidebar.number_input(
+    "Traffic Ratio Threshold", min_value=1.0, max_value=5.0, value=1.3
+)
 
-if uploaded_file:
-    try:
-        # Load Excel file
-        df = pd.read_excel(uploaded_file)
-        df = df.dropna()
+# --- File Upload ---
+uploaded_file = st.file_uploader("📂 Upload your LTE Excel file", type=["xlsx"])
 
-        # Extract Sector and Band from LNCEL name
-        df['Sector'] = df['LNCEL name'].astype(str).str[-1]
-        df['Band'] = df['LNCEL name'].astype(str).str[-2]
+if uploaded_file is not None:
+    # --- Load and Clean Data ---
+    df = pd.read_excel(uploaded_file)
+    df = df.dropna()
 
-        # Drop unnecessary column
-        df = df.drop(columns=['Period start time'], errors='ignore')
+    # Extract Sector & Band
+    df['Sector'] = df['LNCEL name'].astype(str).str[-1]
+    df['Band'] = df['LNCEL name'].astype(str).str[-2]
 
-        # Convert numeric columns
-        exclude_cols = ['LNCEL name', 'Band', 'Sector', 'LNBTS name']
-        for col in df.columns:
-            if col not in exclude_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Drop unused columns
+    df = df.drop(columns=['Period start time'], errors='ignore')
 
-        # Average per cell
-        avg_df = df.groupby(['LNCEL name', 'Band', 'Sector', 'LNBTS name'], as_index=False).mean()
+    # Convert KPI columns to numeric
+    exclude_cols = ['LNCEL name', 'Band', 'Sector', 'LNBTS name']
+    for col in df.columns:
+        if col not in exclude_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Violation checks
-        group_cols = ['LNBTS name', 'Sector']
-        violation_results = []
+    # --- Group by Cell & Average ---
+    avg_df = df.groupby(['LNCEL name', 'Band', 'Sector', 'LNBTS name'], as_index=False).mean()
 
-        for (lnbts, sector), group in avg_df.groupby(group_cols):
-            entry = {'LNBTS name': lnbts, 'Sector': sector}
+    # --- Detect Violations ---
+    violation_results = []
+    for (lnbts, sector), group in avg_df.groupby(['LNBTS name', 'Sector']):
+        entry = {'LNBTS name': lnbts, 'Sector': sector}
 
-            # PRB Violation
-            prb_max = group['E-UTRAN Avg PRB usage per TTI DL'].max()
-            prb_min = group['E-UTRAN Avg PRB usage per TTI DL'].min()
-            entry['PRB Violation'] = (prb_max - prb_min) > 30
+        # PRB Violation
+        prb_max = group['E-UTRAN Avg PRB usage per TTI DL'].max()
+        prb_min = group['E-UTRAN Avg PRB usage per TTI DL'].min()
+        entry['PRB Violation'] = (prb_max - prb_min) > prb_threshold
 
-            # User THP Violation
-            thp_sum = group['E-UTRAN avg IP sched thp DL, QCI9'].sum()
-            if thp_sum > 0:
-                thp_norm = group['E-UTRAN avg IP sched thp DL, QCI9'] / thp_sum
-                entry['User THP Violation'] = (thp_norm.max() / thp_norm.min()) > 1.3
-            else:
-                entry['User THP Violation'] = False
+        # User THP Violation
+        thp_sum = group['E-UTRAN avg IP sched thp DL, QCI9'].sum()
+        if thp_sum > 0:
+            thp_norm = group['E-UTRAN avg IP sched thp DL, QCI9'] / thp_sum
+            thp_ratio = thp_norm.max() / thp_norm.min()
+            entry['User THP Violation'] = thp_ratio > thp_ratio_threshold
+        else:
+            entry['User THP Violation'] = False
 
-            # Traffic Violation
-            traffic_sum = group['PDCP SDU Volume, DL'].sum()
-            if traffic_sum > 0:
-                traffic_norm = group['PDCP SDU Volume, DL'] / traffic_sum
-                entry['Traffic Violation'] = (traffic_norm.max() / traffic_norm.min()) > 1.3
-            else:
-                entry['Traffic Violation'] = False
+        # Traffic Violation
+        traffic_sum = group['PDCP SDU Volume, DL'].sum()
+        if traffic_sum > 0:
+            traffic_norm = group['PDCP SDU Volume, DL'] / traffic_sum
+            traffic_ratio = traffic_norm.max() / traffic_norm.min()
+            entry['Traffic Violation'] = traffic_ratio > traffic_ratio_threshold
+        else:
+            entry['Traffic Violation'] = False
 
-            violation_results.append(entry)
+        violation_results.append(entry)
 
-        violation_df = pd.DataFrame(violation_results)
-        result = avg_df.merge(violation_df, on=['LNBTS name', 'Sector'], how='left')
+    violation_df = pd.DataFrame(violation_results)
 
-        st.success("✅ Processing complete!")
-        st.dataframe(result.head(10))
+    # --- Merge Results ---
+    avg_df_with_violations = avg_df.merge(violation_df, on=['LNBTS name', 'Sector'], how='left')
 
-        # Prepare download
-        output = BytesIO()
-        result.to_excel(output, index=False, engine='openpyxl')
-        output.seek(0)
+    # --- Calculate Summary Stats ---
+    total_sectors = len(avg_df_with_violations[['LNBTS name', 'Sector']].drop_duplicates())
+    criteria = ['PRB Violation', 'User THP Violation', 'Traffic Violation']
+    stats = []
+    for c in criteria:
+        violated = avg_df_with_violations[c].sum()
+        percent = (violated / total_sectors) * 100 if total_sectors > 0 else 0
+        stats.append({
+            'Criteria': c,
+            'Violated Sectors': int(violated),
+            'Total Sectors': total_sectors,
+            '% Unbalanced': round(percent, 1)
+        })
+    stats_df = pd.DataFrame(stats)
 
-        st.download_button(
-            label="📥 Download Processed Excel",
-            data=output,
-            file_name="output_with_sector_band.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    # --- Display Outputs ---
+    st.subheader("📊 Detailed Results (first 50 rows)")
+    st.dataframe(avg_df_with_violations.head(50))
 
-    except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
+    st.subheader("📈 Violation Statistics Summary")
+    st.dataframe(stats_df)
+
+    st.bar_chart(stats_df.set_index('Criteria')['% Unbalanced'])
+
+    # --- Export to Excel (2 sheets) ---
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        avg_df_with_violations.to_excel(writer, sheet_name='Detailed Results', index=False)
+        stats_df.to_excel(writer, sheet_name='Violation Summary', index=False)
+
+    st.download_button(
+        label="💾 Download Results as Excel (with Stats)",
+        data=output.getvalue(),
+        file_name="sector_balance_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
 else:
-    st.info("👆 Please upload an Excel file to begin analysis.")
+    st.info("👆 Please upload your LTE Excel file to start the analysis.")
 
